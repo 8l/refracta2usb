@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# refracta2usb .03? 2013-03-11
+#
+# This script runs in three different modes:
+# - Creates a live-USB from a live-CD image
+# - Creates a live-USB from a running live-CD or live-USB session.
+# - Replaces the live image on a usb stick with a different one from a
+# live-CD .iso file.
+#
+
+# Copied from snapshot2usb, David Hare (dzz) June 2011 davidhare77@yahoo.co.uk
+# adapted for Refracta by fsmithred	February 2013 fsmithred@gmail.com
+# License: GPL-3
+
+
+# if yad is installed, use in preference
+if [[ -f /usr/bin/yad ]]; then
+
+	DIALOG="yad"
+	INFO="image=gtk-dialog-info"
+	QUESTION="image=gtk-dialog-question"
+	WARNING="image=gtk-dialog-warning"
+	ERROR="image=gtk-dialog-error"
+	
+	#buttons
+	BUTTON0="button"
+	BUTTON1="button"
+	BUTTON0NUM=":0"
+	BUTTON1NUM=":1"
+
+#cancel button always returns 1 as $?
+#ok button always returns 0 as $?
+#ok is default (highlighted)
+#buttons in yad dialog window may show reversed from zenity window, e.g.
+#yad: ok -- cancel (0 -- 1)
+#zenity: cancel -- ok (1 -- 0)
+
+elif [[ -f /usr/bin/zenity ]]; then
+
+	# use zenity
+	
+	DIALOG="zenity"
+	INFO="info"
+	QUESTION="question"
+	WARNING="warning"
+	ERROR="error"
+	
+	#buttons
+	BUTTON0="ok-label"
+	BUTTON1="cancel-label"
+	BUTTON0NUM=""
+	BUTTON1NUM=""
+
+else
+
+	xterm -fa monaco -fs 12 -hold -e echo "
+  Neither Yad nor Zenity is installed. 
+  You can't run this program without one of those.  
+  Exiting...
+  "
+  exit 1
+fi
+
+
+TITLE="refracta2usb"
+
+echo "" > ~/${TITLE}.log
+exec > >(tee -a ~/${TITLE}.log) 2>&1
+
+# this script must be called from a terminal 
+if ! [ -t 0 ]; then
+echo "Not a terminal"
+$DIALOG --$ERROR --width=400 --height=100 --title="$TITLE" --text=$"Please run $TITLE from a terminal"
+exit 1
+fi
+
+# root should NOT run this script
+if [[ $(id -u) -eq 0 ]]; then
+$DIALOG --$ERROR --width=400 --height=160 --title="$TITLE" --text=$"$TITLE must be run by normal user (not root)"
+exit 1
+fi
+
+
+exit_dialog () {
+$DIALOG --$ERROR --title="$TITLE" --text=$"$TITLE will now exit due to error or user action" 
+pumount /dev/${DEVICE}1
+exit 1
+}
+
+
+detect () {
+
+USBDEVLIST=$(/usr/sbin/hwinfo --usb --short|grep "/dev/sd"|awk '{print $1}')
+USBDEVFULLLIST=$(/usr/sbin/hwinfo --usb --short|grep "/dev/sd"|awk '{print $0}')
+
+echo "$USBDEVLIST"
+
+if [ "$USBDEVLIST" = "" ]; then
+
+$DIALOG --width=400 --height=160 --title="$TITLE" --$ERROR --text=$"Cannot continue:\n\n No usb devices detected.
+Exiting..."
+exit 0
+fi
+
+SELECTED=$($DIALOG --width=400 --height=200 --title="$TITLE" --list --separator="" --column="" --text=$"Detected USB devices:\n\n$USBDEVFULLLIST \n\nPlease select the correct one to use" $USBDEVLIST)
+
+echo "$SELECTED"
+DEVICE=$(echo $SELECTED|grep -o 'sd[a-z]')
+echo "$DEVICE"
+
+#check if is mounted
+if [ "$DEVICE" = "" ]; then
+
+$DIALOG --width=400 --height=160 --title="$TITLE" --$ERROR --text=$"Error!\n\n No device was selected
+Exiting..."
+exit 0
+fi
+
+MOUNTED=$(cat /proc/mounts |grep "${DEVICE}"|awk '{print $1}')
+echo "$MOUNTED"
+
+if  [[ -n "$MOUNTED" ]]; then
+echo "$MOUNTED is mounted"
+
+$DIALOG --width=400 --height=120 --title="$TITLE" --$ERROR --text=$"Cannot continue:\n\nDevice /dev/${DEVICE}1 appears to be mounted.
+Exiting..."
+exit 0
+fi
+
+#check if part1 is vfat
+ISFAT=$(/sbin/blkid|grep "/dev/${DEVICE}1"|grep -i fat|grep -o "/dev/sd[a-z][0-9]")
+
+echo $ISFAT
+
+if [ "$ISFAT" = "" ]; then
+
+$DIALOG --width=400 --height=160 --title="$TITLE" --$ERROR --text=$"Cannot continue!\n\n/dev/${DEVICE}1 must be FAT formatted.
+Exiting..."
+exit 0
+fi
+
+}
+
+
+# Show free space on usb device and size of filesystem to copy to it.
+check_size () {
+device_freespace=$(df -h $usb_mountpoint) #| awk '/dev/ { print $4 }')
+
+#filesystem_size=$(du -sh "$image_mountpoint"| awk '{ print $1 }')
+#filesystem_size=$(ls -lh "$image_mountpoint"/live/filesystem.squashfs | awk '{ print $5 }')
+#filesystem_size=$(du -sh "$image_mountpoint")
+#alternate_size=$(ls -lh "$isofile" | awk '{ print $5 }')
+
+TEXT="Make sure you have enough space on the device to hold the image.
+
+Device size:
+
+$device_freespace
+
+Image size:\t$image_size
+"
+
+
+$DIALOG --$QUESTION --width=680 --height=220 --title="$TITLE" --${BUTTON0}="Continue"${BUTTON0NUM} --${BUTTON1}="Exit"${BUTTON1NUM} --text="$TEXT"
+
+	if [[ $? != 0 ]] ; then
+
+		echo " Exiting at check_size"
+		pumount /dev/${DEVICE}1
+		if [[ -d $image_mountpoint ]] ; then
+			fusermount -u "$image_mountpoint"
+		fi		
+		exit 0
+	fi
+}
+
+
+# Copy system from a mounted iso
+copy_iso () {
+	isofile=$($DIALOG --file-selection --width=640 --height=640 --title=$"Select Live ISO") #file picker
+
+	if [[ -z "$isofile" ]]; then
+		exit_dialog
+	fi
+
+	fuseiso -p "$isofile" "$image_mountpoint"
+#	image_size=$(ls -lh "$isofile" | awk '{ print $5 }')
+	image_size=$(du -h "$isofile" ) #| awk '{ print $1 }')
+	check_size
+	rsync -av  --exclude=isolinux "$image_mountpoint"/ "$usb_mountpoint"
+#	rsync -av /usr/lib/refracta2usb/hooks "$usb_mountpoint"/live/
+	rsync -av hooks "$usb_mountpoint"/live/
+	sleep 2
+	fusermount -u "$image_mountpoint"
+}
+
+
+# Copy system from the running live system
+copy_livemount () {
+	image_size=$(du -sh "$image_mountpoint")
+	check_size
+	rsync -av --exclude=isolinux "$image_mountpoint"/ "$usb_mountpoint"
+	rsync -av hooks "$usb_mountpoint"/live/
+}
+
+
+# Replace the live folder with one from an iso file.
+replace_live () {
+	isofile=$($DIALOG --file-selection --width=640 --height=640 --title=$"Select Live ISO") #file picker
+	if [[ -z "$isofile" ]]; then
+		exit_dialog
+	fi
+echo "$isofile"
+	fuseiso -p "$isofile" "$image_mountpoint"
+#	image_size=$(ls -lh "$isofile" | awk '{ print $5 }')
+	image_size=$(du -h "$isofile" ) #| awk '{ print $1 }')
+	check_size
+
+	if [[ -d "$usb_mountpoint/live/hooks" ]] ; then
+		save_hooks="yes"
+		rsync -av "$usb_mountpoint/live/hooks" tmp/
+	fi
+
+	rm -rf "$usb_mountpoint"/live
+	rm -f "$usb_mountpoint"/Release_Notes
+	rm -rf "$usb_mountpoint"/pkglist*
+	rsync -av  --exclude=isolinux "$image_mountpoint"/ "$usb_mountpoint"
+
+	if [[ $save_hooks = "yes" ]] ; then
+		rsync -av tmp/hooks "$usb_mountpoint"/live/
+		rm -rf tmp/hooks
+	fi
+
+	echo -e "Replaced image.\nUnmounting image and usb device...!"
+	sleep 2
+	fusermount -u "$image_mountpoint"
+	pumount /dev/${DEVICE}1
+	echo "Done!"
+	exit 0
+}
+
+
+run_task () {
+opts=$($DIALOG --list --title="Options" \
+     --text="Choose a task." \
+     --list --column "" --column "" \
+     --width=590 --height=330  \
+  ISO	" Copy files from a CD image to the USB stick." \
+  Live	" Copy the files from a running live system." \
+  Update " Replace the live image on USB with a newer one." \
+  xx  " Exit this program now.")
+
+echo "$opts"
+
+if $(echo $opts | grep -q ISO); then
+	use_iso="yes"
+	image_mountpoint="./isomount"
+fi
+if $(echo $opts | grep -q Live); then
+	use_livemount="yes"
+	image_mountpoint="/lib/live/mount/medium"
+	if ! [[ -d "$image_mountpoint" ]] ; then
+		exit_dialog
+	fi
+fi
+if $(echo $opts | grep -q Update); then
+	update_image="yes"
+	image_mountpoint="./isomount"
+fi
+if $(echo $opts | grep -q xx); then
+echo $opts | awk -F"|" '{ print $1 }'
+	exit 0
+fi
+}
+
+
+# The work starts here
+
+run_task
+
+detect
+
+usb_mountpoint="/media/${DEVICE}1"
+# mount device
+pmount /dev/${DEVICE}1
+
+# check if syslinux is installed already
+if [[ $use_iso = "yes" ]] || [[ $use_livemount = "yes" ]] ; then
+	SYSLINUX_ALREADY_INSTALLED=$(find /media/${DEVICE}1/ -maxdepth 2 -type f -name syslinux.cfg)
+
+	if [ -n "$SYSLINUX_ALREADY_INSTALLED" ]; then
+		echo "test... $SYSLINUX_ALREADY_INSTALLED"
+
+		TEXT=" Syslinux is already installed to ${DEVICE}1 \n\n Existing configs will be overwritten \n\n You do not need this script to append to a multiboot setup"
+
+		$DIALOG --$QUESTION --width=480 --height=320 --title="$TITLE" --${BUTTON0}="Continue"${BUTTON0NUM} --${BUTTON1}="Exit"${BUTTON1NUM} --text="$TEXT"
+
+		if [[ $? != 0 ]] ; then
+
+			echo " Syslinux is already installed"
+			pumount /dev/${DEVICE}1
+			if [[ -d $image_mountpoint ]] ; then
+				fusermount -u "$image_mountpoint"
+			fi				
+			exit 0
+		fi
+	fi
+fi
+
+
+# Do the chosen task
+if [[ $use_iso = "yes" ]] ; then
+	copy_iso
+elif [[ $use_livemount = "yes" ]] ; then
+	copy_livemount
+elif [[ $update_image = "yes" ]] ; then
+	replace_live
+else
+	exit_dialog
+fi
+
+
+# copy syslinux folder
+#syslinux_template="/usr/lib/refracta2usb/syslinux"
+syslinux_template="./syslinux"
+rsync -av "$syslinux_template" "$usb_mountpoint"
+syslinux -d syslinux /dev/${DEVICE}1 \
+|| echo "
+ Warning! You may need to run this command as root:
+	syslinux -d syslinux /dev/${DEVICE}1
+"
+
+pumount /dev/${DEVICE}1
+exit 0
